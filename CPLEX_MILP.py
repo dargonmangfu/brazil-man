@@ -60,7 +60,7 @@ class FJSP_CPLEX_Solver:
                     j = len(midx[v]) # 当前已有的机器数
                     midx[v][M] = j # 记录机器 M 在操作 v 上的索引
         
-        # 创建软约束映射，指机器内顺序约束
+        # 创建软约束映射，指机器内顺序约束。现在没有考虑先后关系，只是在记录每个机器上操作对
         soft = {}
         for M in range(self.nmach):
             for v in range(self.nop - 1):
@@ -104,6 +104,7 @@ class FJSP_CPLEX_Solver:
         
         print(f"L = {L}")
         
+        #这是在检查数据的可行性，即原始数据是否有错误
         # 检查是否有操作没有可行机器分配
         empty_ops = [v for v in range(self.nop) if len(midx[v]) == 0]
         if empty_ops:
@@ -126,17 +127,17 @@ class FJSP_CPLEX_Solver:
                 print("设置线程数失败或未生效（PySCIPOpt 参数可能不同），已忽略。")
 
         # 变量
-        z = model.addVar("z", vtype="C", lb=0.0)
-        s_vars = [model.addVar(f"s_{v}", vtype="C", lb=0.0) for v in range(self.nop)]
-        c_vars = [model.addVar(f"c_{v}", vtype="C", lb=0.0) for v in range(self.nop)]
-        # x 二进制变量，按 soft 索引创建
+        z = model.addVar("z", vtype="C", lb=0.0) # 目标 makespan 最小总时间
+        s_vars = [model.addVar(f"s_{v}", vtype="C", lb=0.0) for v in range(self.nop)] # s 开始时间变量
+        c_vars = [model.addVar(f"c_{v}", vtype="C", lb=0.0) for v in range(self.nop)] # c 完成时间变量
+        # x 二进制变量，按 soft 索引创建,对应文中y_{v,w,k}（在同一台机器 k 上 v 是否先于 w）
         num_x = len(soft)
         x_vars = [None] * num_x
         for (v, w), idx in soft.items():
             # 可能被重复赋值两次，但指向相同 idx 的赋值结果相同
             if x_vars[idx] is None:
-                x_vars[idx] = model.addVar(f"x_{v}_{w}", vtype="B")
-        # f 分配二进制变量
+                x_vars[idx] = model.addVar(f"x_{v}_{w}", vtype="B") #vtype="B"表示以二进制储存，没有设置初始变量；在调用 optimize() 之前变量没有数值意义。
+        # f 分配二进制变量,对应文中：x_{v,k}（二进制，工序 v 是否分配到机器 k）
         f_vars = []
         for v in range(self.nop):
             fv = []
@@ -187,7 +188,9 @@ class FJSP_CPLEX_Solver:
         model.optimize()
 
         status = model.getStatus()
-        if status.isOptimal() or status.isFeasible():
+        # getStatus() 在 PySCIPOpt 中返回字符串，使用字符串判断更稳健
+        status_str = str(status).lower()
+        if ("optimal" in status_str) or ("feasible" in status_str):
             solve_time = model.getSolvingTime()
             print(f"Solution found in {solve_time:.2f} seconds")
             z_val = model.getVal(z)
@@ -213,6 +216,8 @@ class FJSP_CPLEX_Solver:
             for (v, w), idx in soft.items():
                 if model.getVal(x_vars[idx]) >= 0.5:
                     print(f"x_{{{v}, {w}}} = 1")
+            #输出总时间
+            print(f"Makespan (z): {z_val:.2f}")
         else:
             print("No feasible solution found")
             print(f"Status: {status}")
@@ -220,7 +225,7 @@ class FJSP_CPLEX_Solver:
 def main():
     """主函数：使用 argparse 解析参数"""
     parser = argparse.ArgumentParser(description="FJSP PySCIPOpt MILP solver")
-    parser.add_argument("input_file", nargs='?', default=r'E:\调度问题\巴西人\MFJS08.txt', help="输入文件路径")
+    parser.add_argument("input_file", nargs='?', default=r'E:\调度问题\巴西人\MK02.txt', help="输入文件路径")
     parser.add_argument("-t", "--timelimit", type=int, default=3600, help="求解时间上限（秒）")
     parser.add_argument("-p", "--maxthreads", type=int, default=1, help="最大线程数")
     parser.add_argument("-s", "--startsol", default="", help="始解文件路径（忽略）")
