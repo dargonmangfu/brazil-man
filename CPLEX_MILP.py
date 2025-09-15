@@ -7,8 +7,10 @@ import argparse
 from readdata import ReadData
 from EST import ESTHeuristic  # 用于产生 EST 上界
 import numpy as np
-import scipy.optimize as sco
-from scipy.optimize import Bounds, LinearConstraint
+# 移除 scipy.optimize 相关导入，改用 PySCIPOpt
+# import scipy.optimize as sco
+# from scipy.optimize import Bounds, LinearConstraint
+from pyscipopt import Model, quicksum
 
 class FJSP_CPLEX_Solver:
     def __init__(self):
@@ -20,7 +22,7 @@ class FJSP_CPLEX_Solver:
         self.Machs = []  # 每个机器能处理的操作集合
         
     def model_and_solve(self, input_file, timelimit=0, maxthreads=1, starts="", preset_L=None):
-        """构建并求解MILP模型"""
+        """构建并求解MILP模型（使用 PySCIPOpt）"""
         # 使用 readdata.ReadData 读取并准备数据
         rd = ReadData()
         rd.read_and_prepare_data(input_file)
@@ -77,7 +79,7 @@ class FJSP_CPLEX_Solver:
         L = 0.0
         
         if starts:
-            print("Warning: Scipy MILP does not support initial solutions. Ignoring starts parameter.")
+            print("Warning: PySCIPOpt 初始解逻辑未实现，忽略 starts 参数。")
             # 保留读取逻辑以计算 L，但不设置初始解
             with open(starts, 'r') as f:
                 # 跳过前三行
@@ -102,79 +104,63 @@ class FJSP_CPLEX_Solver:
         
         print(f"L = {L}")
         
-        # 计算变量数量和索引
-        num_s = self.nop # 开始时间变量数量
-        num_c = self.nop # 完成时间变量数量
-        num_x = len(soft) # 软约束变量数量
-        num_f = sum(len(midx[v]) for v in range(self.nop)) # 机器可以分配的工序数量和
-        total_vars = 1 + num_s + num_c + num_x + num_f  # z, s, c, x, f
-        
-        idx_z = 0 # z 变量索引
-        idx_s = 1 # s 变量起始索引 对应文中s_{v,k}
-        idx_c = idx_s + num_s # 对应t_{v,k}（完成时间，按机）
-        idx_x = idx_c + num_c 
-        idx_f = idx_x + num_x 
-        
-        # 对应文中：x_{v,k}（二进制，工序 v 分配到机器 k）
-        f_indices = [] 
-        f_start = idx_f
-        for v in range(self.nop):
-            f_indices.append([f_start + k for k in range(len(midx[v]))]) # 记录操作 v 的 f 变量索引
-            f_start += len(midx[v])
-        
-        # 目标函数系数
-        c_obj = np.zeros(total_vars)
-        c_obj[idx_z] = 1  # minimize z
-        
-        # 变量界限 - 使用 Bounds 对象而不是元组列表
-        lb = np.zeros(total_vars)  # 所有变量下界为0
-        ub = np.full(total_vars, np.inf)  # 所有变量上界为无穷
+        # 检查是否有操作没有可行机器分配
+        empty_ops = [v for v in range(self.nop) if len(midx[v]) == 0]
+        if empty_ops:
+            print("不可行：以下操作没有任何可行机器分配（midx[v] 为空）：", empty_ops)
+            return
+        else:
+            print("nice,牛啊！所有操作都有可行机器分配。")
 
-        
-        # 变量类型
-        integrality = np.zeros(total_vars, dtype=int)
-        # 设置 x 变量为二进制变量，对应文中y_{v,w,k}（在同一台机器 k 上 v 是否先于 w）初始化全为1
-        for i in range(idx_x, idx_x + num_x):
-            integrality[i] = 1  
-        # 设置 f 变量为二进制变量 对应文中：x_{v,k}（二进制，工序 v 是否分配到机器 k）初始化全为1
-        for v in range(self.nop):
-            for idx in f_indices[v]:
-                integrality[idx] = 1
-        bounds = Bounds(lb, ub) #保证不来负数
+        # 使用 PySCIPOpt 构建模型
+        model = Model("FJSP_PySCIPOpt")
+        # 可选设置
+        if timelimit and timelimit > 0:
+            model.setParam('limits/time', float(timelimit))
+            print(f"Time limit set to {timelimit}")
+        if maxthreads and maxthreads > 0:
+            try:
+                model.setParam('threads', int(maxthreads))
+                print(f"Maximum threads set to {maxthreads}")
+            except Exception:
+                print("设置线程数失败或未生效（PySCIPOpt 参数可能不同），已忽略。")
 
-        # 约束矩阵
-        A_ub = []
-        b_ub = []
-        A_eq = []
-        b_eq = []
-        
+        # 变量
+        z = model.addVar("z", vtype="C", lb=0.0)
+        s_vars = [model.addVar(f"s_{v}", vtype="C", lb=0.0) for v in range(self.nop)]
+        c_vars = [model.addVar(f"c_{v}", vtype="C", lb=0.0) for v in range(self.nop)]
+        # x 二进制变量，按 soft 索引创建
+        num_x = len(soft)
+        x_vars = [None] * num_x
+        for (v, w), idx in soft.items():
+            # 可能被重复赋值两次，但指向相同 idx 的赋值结果相同
+            if x_vars[idx] is None:
+                x_vars[idx] = model.addVar(f"x_{v}_{w}", vtype="B")
+        # f 分配二进制变量
+        f_vars = []
+        for v in range(self.nop):
+            fv = []
+            for k in range(len(midx[v])):
+                fv.append(model.addVar(f"f_{v}_{k}", vtype="B"))
+            f_vars.append(fv)
+
+        # 目标：最小化 z
+        model.setObjective(z, "minimize")
+
         # 约束(1): s[v] + c[v] <= z
         for v in range(self.nop):
-            row = np.zeros(total_vars)
-            row[idx_z] = -1
-            row[idx_s + v] = 1
-            row[idx_c + v] = 1
-            A_ub.append(row)
-            b_ub.append(0)
-        
-        # 约束(2): sum f_vars[v] == 1，确定一个工序只对应一个机器
+            model.addCons(s_vars[v] + c_vars[v] <= z)
+
+        # 约束(2): 每个工序分配到且仅到一台机器
         for v in range(self.nop):
-            row = np.zeros(total_vars)
-            for k in range(len(midx[v])):
-                row[f_indices[v][k]] = 1
-            A_eq.append(row)
-            b_eq.append(1)
-        
+            model.addCons(quicksum(f_vars[v][k] for k in range(len(midx[v]))) == 1)
+
         # 约束(3): c[v] == sum prtime[v][M] * f_vars[v][k]
         for v in range(self.nop):
-            row = np.zeros(total_vars)
-            row[idx_c + v] = 1
-            for M, k in midx[v].items():
-                row[f_indices[v][k]] = -self.prtime[v][M]
-            A_eq.append(row)
-            b_eq.append(0)
-        
-        # 约束(4): 同一机器上的操作必须有顺序
+            expr = quicksum(self.prtime[v][M] * f_vars[v][k] for M, k in midx[v].items())
+            model.addCons(c_vars[v] == expr)
+
+        # 约束(4): 同一机器上的操作必须有顺序： -x_vw - x_wv + f_v + f_w <= 1
         for M in range(self.nmach):
             for v in range(self.nop - 1):
                 if v not in self.Machs[M]:
@@ -186,124 +172,58 @@ class FJSP_CPLEX_Solver:
                     j = midx[w][M]
                     k = soft[(v, w)]
                     kk = soft[(w, v)]
-                    # 正确的 "至少一个顺序" 约束： x_vw + x_wv >= f_v + f_w - 1
-                    # 转为 A_ub * x <= b_ub 的形式： -x_vw - x_wv + f_v + f_w <= 1
-                    row = np.zeros(total_vars)
-                    row[idx_x + k] = -1
-                    row[idx_x + kk] = -1
-                    row[f_indices[v][i]] = 1
-                    row[f_indices[w][j]] = 1
-                    A_ub.append(row)
-                    b_ub.append(1)
-        
-        # 约束(5): 软约束的顺序关系
+                    model.addCons(- x_vars[k] - x_vars[kk] + f_vars[v][i] + f_vars[w][j] <= 1)
+
+        # 约束(5): 软约束的顺序关系: s_v + c_v + L*x_idx - s_w <= L
         for (v, w), idx in soft.items():
-            row = np.zeros(total_vars)
-            row[idx_s + v] = 1
-            row[idx_c + v] = 1
-            row[idx_x + idx] = L
-            row[idx_s + w] = -1
-            A_ub.append(row)
-            b_ub.append(L)
-        
-        # 约束(6): 有向无环图的顺序约束
+            model.addCons(s_vars[v] + c_vars[v] + L * x_vars[idx] - s_vars[w] <= L)
+
+        # 约束(6): DAG 的顺序约束: s_v + c_v - s_w <= 0
         for v in range(self.nop):
             for w in self.dag[v]:
-                row = np.zeros(total_vars)
-                row[idx_s + v] = 1
-                row[idx_c + v] = 1
-                row[idx_s + w] = -1
-                A_ub.append(row)
-                b_ub.append(0)
-        
-        # 转换为numpy数组
-        A_ub = np.array(A_ub)
-        b_ub = np.array(b_ub)
-        A_eq = np.array(A_eq)
-        b_eq = np.array(b_eq)
-        
-        # 构建约束对象
-        constraints = []
-        # 不等式约束：A_ub * x <= b_ub
-        if A_ub.size > 0:
-            constraints.append(LinearConstraint(A_ub, -np.inf * np.ones(len(b_ub)), b_ub))
-        
-        # 等式约束：A_eq * x == b_eq
-        if A_eq.size > 0:
-            constraints.append(LinearConstraint(A_eq, b_eq, b_eq))
-        
-        # 求解参数
-        start_time = time.time()
-        options = {}
-        if timelimit > 0:
-            options['time_limit'] = timelimit
+                model.addCons(s_vars[v] + c_vars[v] - s_vars[w] <= 0)
 
-        # Debug checks before calling milp
-        # 检查是否有操作没有可行机器分配
-        empty_ops = [v for v in range(self.nop) if len(midx[v]) == 0]
-        if empty_ops:
-            print("不可行：以下操作没有任何可行机器分配（midx[v] 为空）：", empty_ops)
-            return
-        else:
-            print("nice,牛啊！所有操作都有可行机器分配。")
+        # 求解
+        model.optimize()
 
-        # 简单的 LP 松弛可行性检查（把 integrality 暂时设为 0）
-        
-        try:
-            integrality_backup = integrality.copy()
-            integrality_relax = np.zeros_like(integrality)
-            print("正在检查 LP 松弛可行性（time_limit=10s）...")
-            res_lp = sco.milp(c=c_obj, bounds=bounds, integrality=integrality_relax,
-                              constraints=constraints, options={'time_limit': 10})
-            if res_lp.success:
-                print("LP 松弛有可行解：说明问题可能出在整数约束或建模逻辑（必须进一步检查 f/x 的互斥/等式）。")
-            else:
-                print("LP 松弛也不可行：说明线性约束或边界存在冲突，需要检查 A_eq/A_ub/b_eq/b_ub。")
-        finally:
-            integrality = integrality_backup
-        # 调用milp求解
-        res = sco.milp(c=c_obj, bounds=bounds, integrality=integrality, 
-                      constraints=constraints, options=options)
-        solve_time = time.time() - start_time
-        
-        # 输出结果
-        if res.success:
+        status = model.getStatus()
+        if status.isOptimal() or status.isFeasible():
+            solve_time = model.getSolvingTime()
             print(f"Solution found in {solve_time:.2f} seconds")
-            print(f"Makespan (z): {res.x[idx_z]:.2f}")
-            
+            z_val = model.getVal(z)
+            print(f"Makespan (z): {z_val:.2f}")
+
             # 输出开始时间
             for v in range(self.nop):
-                print(f"s_{{{v}}} = {res.x[idx_s + v]:.2f}")
+                print(f"s_{{{v}}} = {model.getVal(s_vars[v]):.2f}")
             
             # 输出完成时间
             for v in range(self.nop):
-                print(f"c_{{{v}}} = {res.x[idx_c + v]:.2f}")
+                print(f"c_{{{v}}} = {model.getVal(c_vars[v]):.2f}")
             
             # 输出机器分配
             for v in range(self.nop):
                 for M in range(self.nmach):
                     if v in self.Machs[M]:
                         k = midx[v][M]
-                        if res.x[f_indices[v][k]] >= 0.99:  # 考虑浮点误差
+                        if model.getVal(f_vars[v][k]) >= 0.5:
                             print(f"f_{{{v}, {M}}} = 1")
-            
+
             # 输出软约束变量
             for (v, w), idx in soft.items():
-                if res.x[idx_x + idx] >= 0.99:
+                if model.getVal(x_vars[idx]) >= 0.5:
                     print(f"x_{{{v}, {w}}} = 1")
         else:
             print("No feasible solution found")
-            print(f"Status: {res.status}")
-            print(f"Message: {res.message}")
+            print(f"Status: {status}")
 
 def main():
     """主函数：使用 argparse 解析参数"""
-    parser = argparse.ArgumentParser(description="FJSP Scipy MILP solver")
-    # 将位置参数改为可选（nargs='?'），并使用原始字符串避免转义警告
+    parser = argparse.ArgumentParser(description="FJSP PySCIPOpt MILP solver")
     parser.add_argument("input_file", nargs='?', default=r'E:\调度问题\巴西人\MFJS08.txt', help="输入文件路径")
-    parser.add_argument("-t", "--timelimit", type=int, default=3600, help="求解时间上限（秒），默认 0 表示不限制")
-    parser.add_argument("-p", "--maxthreads", type=int, default=1, help="最大线程数（scipy不支持，直接忽略），默认 1")
-    parser.add_argument("-s", "--startsol", default="", help="始解文件路径（scipy不支持初始解，直接忽略）")
+    parser.add_argument("-t", "--timelimit", type=int, default=3600, help="求解时间上限（秒）")
+    parser.add_argument("-p", "--maxthreads", type=int, default=1, help="最大线程数")
+    parser.add_argument("-s", "--startsol", default="", help="始解文件路径（忽略）")
     args = parser.parse_args()
 
     input_file = args.input_file
@@ -314,9 +234,7 @@ def main():
     if timelimit > 0:
         print(f"Time limit set to {timelimit}")
     if maxthreads > 0:
-        print(f"Maximum threads set to {maxthreads} (ignored in scipy)")
-    if startsol:
-        print(f"Start solution file: {startsol} (ignored in scipy)")
+        print(f"Maximum threads set to {maxthreads} (may be ignored)")
 
     # 尝试使用 EST 启发式计算上界作为 preset_L（仅在没有外部 startsol 时使用）
     preset_L = None
