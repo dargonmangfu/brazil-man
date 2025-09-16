@@ -19,7 +19,7 @@ class ESTHeuristic:
         self.st = None  # 开始时间
         self.ct = None  # 完成时间
         self.mks = 0  # 最大完成时间（makespan）
-        self.text = "sfjs01.txt"  # 默认输入文件名
+        self.text = "YFJS01.txt"  # 默认输入文件名
     
     def est_heuristic(self):
         # 计算平均处理时间（与 C 版本对应）
@@ -165,15 +165,20 @@ class ESTHeuristic:
         self.Adj = rd.Adj
         self.Prt = rd.Prt
         self.infinite = rd.infinite
-         # 调用启发式和输出结果
+        # 遍历 self.Prt，将等于 0 的值赋值为 self.infinite 防止0处理时间
+        for i in range(self.n):
+            for j in range(self.numm):
+                if self.Prt[i][j] == 0:
+                    self.Prt[i][j] = self.infinite
+        # 调用启发式和输出结果
         self.est_heuristic()
         #self.print_adj()
-        '''
+        
         print(f"mks={self.mks}")
         print("\n i uu[i] ff[i] st[i] ct[i]")
         for i in range(self.n):
             print(f"{i:2d} {self.uu[i]:5d} {self.ff[i]:5d} {self.st[i]:5d} {self.ct[i]:5d}")
-        '''
+        
 
 # 主程序
 if __name__ == "__main__":
