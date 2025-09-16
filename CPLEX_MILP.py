@@ -125,8 +125,8 @@ class FJSP_CPLEX_Solver:
 
         # 变量
         z = model.addVar("z", vtype="C", lb=0.0) # 目标 makespan 最小总时间
-        s_vars = [model.addVar(f"s_{v}", vtype="C", lb=0.0) for v in range(self.nop)] # s 开始时间变量
-        c_vars = [model.addVar(f"c_{v}", vtype="C", lb=0.0) for v in range(self.nop)] # c 完成时间变量
+        s_vars = [model.addVar(f"s_{v}", vtype="C", lb=0.0) for v in range(self.nop)] # s 开始时间变量 已经命令下限为0，不会出现负数。15，16约束实现。
+        c_vars = [model.addVar(f"c_{v}", vtype="C", lb=0.0) for v in range(self.nop)] # c 操作时间变量
         # x 二进制变量，按 soft 索引创建,对应文中y_{v,w,k}（在同一台机器 k 上 v 是否先于 w）
         num_x = len(soft)
         x_vars = [None] * num_x
@@ -145,25 +145,25 @@ class FJSP_CPLEX_Solver:
         # 目标：最小化 z
         model.setObjective(z, "minimize")
 
-        # 约束(1): s[v] + c[v] <= z
+        # 约束(1): s[v] + c[v] <= z 此约束也完成了 s[v] <= z 的隐含约束,即英文中的10约束
         for v in range(self.nop):
             model.addCons(s_vars[v] + c_vars[v] <= z)
 
-        # 约束(2): 每个工序分配到且仅到一台机器
+        # 约束(2): 每个工序分配到且仅到一台机器 约束9
         for v in range(self.nop):
             model.addCons(quicksum(f_vars[v][k] for k in range(len(midx[v]))) == 1)
 
-        # 约束(3): c[v] == sum prtime[v][M] * f_vars[v][k]
+        # 约束(3): c[v] == sum prtime[v][M] * f_vars[v][k] 通过约束操作时间，间接实现了约束12
         for v in range(self.nop):
             expr = quicksum(self.prtime[v][M] * f_vars[v][k] for M, k in midx[v].items())
             model.addCons(c_vars[v] == expr)
 
-        # 约束(4): 同一机器上的操作必须有顺序： -x_vw - x_wv + f_v + f_w <= 1
+        # 约束(4): 同一机器上的操作必须有顺序： -x_vw - x_wv + f_v + f_w <= 1 实现约束11
         for M in range(self.nmach):
             for v in range(self.nop - 1):
                 if v not in self.Machs[M]:
                     continue
-                for w in range(v + 1, self.nop):
+                for w in range(v + 1, self.nop):#f_v 和 f_w 都为1，表示在同一个机器上。
                     if w not in self.Machs[M]:
                         continue
                     i = midx[v][M]
@@ -172,11 +172,11 @@ class FJSP_CPLEX_Solver:
                     kk = soft[(w, v)]
                     model.addCons(- x_vars[k] - x_vars[kk] + f_vars[v][i] + f_vars[w][j] <= 1)
 
-        # 约束(5): 软约束的顺序关系: s_v + c_v + L*x_idx - s_w <= L
+        # 约束(5): 软约束的顺序关系: s_v + c_v + L*x_idx - s_w <= L 约束13
         for (v, w), idx in soft.items():
             model.addCons(s_vars[v] + c_vars[v] + L * x_vars[idx] - s_vars[w] <= L)
 
-        # 约束(6): DAG 的顺序约束: s_v + c_v - s_w <= 0
+        # 约束(6): DAG 的顺序约束: s_v + c_v - s_w <= 0，满足前序工序的完成时间不超过后续工序的开始时间，约束14
         for v in range(self.nop):
             for w in self.dag[v]:
                 model.addCons(s_vars[v] + c_vars[v] - s_vars[w] <= 0)
@@ -197,7 +197,7 @@ class FJSP_CPLEX_Solver:
             for v in range(self.nop):
                 print(f"s_{{{v}}} = {model.getVal(s_vars[v]):.2f}")
             
-            # 输出完成时间
+            # 输出每个操作的完成时间
             for v in range(self.nop):
                 print(f"c_{{{v}}} = {model.getVal(c_vars[v]):.2f}")
             
@@ -213,6 +213,34 @@ class FJSP_CPLEX_Solver:
             for (v, w), idx in soft.items():
                 if model.getVal(x_vars[idx]) >= 0.5:
                     print(f"x_{{{v}, {w}}} = 1")
+                    
+            # 按机器汇总操作信息
+            machine_operations = defaultdict(list)
+            for v in range(self.nop):
+                for M in range(self.nmach):
+                    if v in self.Machs[M]:
+                        k = midx[v][M]
+                        if model.getVal(f_vars[v][k]) >= 0.5:
+                            start_time = model.getVal(s_vars[v])
+                            proc_time = model.getVal(c_vars[v])
+                            machine_operations[M].append({
+                                'operation': v,
+                                'start_time': start_time,
+                                'proc_time': proc_time,
+                                'end_time': start_time + proc_time
+                            })
+
+            # 按机器编号输出排序后的操作安排
+            print("\n=== 机器工序安排 ===")
+            for M in sorted(machine_operations.keys()):
+                # 按开始时间排序
+                sorted_ops = sorted(machine_operations[M], key=lambda x: x['start_time'])
+                
+                print(f"\n机器 {M} 的工序安排:")
+                print("工序\t开始时间\t处理时间\t结束时间")
+                for op in sorted_ops:
+                    print(f"{op['operation']}\t{op['start_time']:.2f}\t{op['proc_time']:.2f}\t{op['end_time']:.2f}")
+                    
             #输出总时间
             print(f"Makespan (z): {z_val:.2f}")
         else:
@@ -222,7 +250,7 @@ class FJSP_CPLEX_Solver:
 def main():
     """主函数：使用 argparse 解析参数"""
     parser = argparse.ArgumentParser(description="FJSP PySCIPOpt MILP solver")
-    parser.add_argument("input_file", nargs='?', default=r'E:\调度问题\巴西人\MK02.txt', help="输入文件路径")
+    parser.add_argument("input_file", nargs='?', default=r'E:\调度问题\巴西人\brazil-man\YFJS01.txt', help="输入文件路径")
     parser.add_argument("-t", "--timelimit", type=int, default=3600, help="求解时间上限（秒）")
     parser.add_argument("-p", "--maxthreads", type=int, default=1, help="最大线程数")
     parser.add_argument("-s", "--startsol", default="", help="始解文件路径（忽略）")
