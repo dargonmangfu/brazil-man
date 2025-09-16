@@ -14,9 +14,9 @@ from pyscipopt import Model, quicksum
 
 class FJSP_CPLEX_Solver:
     def __init__(self):
-        self.nop = 0  # 操作数量
-        self.nmach = 0  # 机器数量
-        self.arcs = 0  # 弧/约束数量
+        self.nop = 0  # 操作数量 |V|
+        self.nmach = 0  # 机器数量 |M|
+        self.arcs = 0  # 弧/约束数量 |A|
         self.prtime = []  # 处理时间矩阵
         self.dag = []  # 有向无环图（邻接表表示）
         self.Machs = []  # 每个机器能处理的操作集合
@@ -33,34 +33,30 @@ class FJSP_CPLEX_Solver:
         self.arcs = rd.numA
 
         # 构建有向无环图（邻接表）dag表明了操作间后缀关系
-        self.dag = [[] for _ in range(self.nop)]
-        for v in range(self.nop):
-            for w in range(self.nop):
-                if rd.Adj[v][w] == 'A':
-                    self.dag[v].append(w)
+        self.dag = rd.dag
 
         # 构建处理时间矩阵和机器集合（仅把可行的机器加入 Machs）
-        self.prtime = [[0] * self.nmach for _ in range(self.nop)] # 每个操作对应的机器开始时间初始化为0
-        self.Machs = [set() for _ in range(self.nmach)] # 每台机器对应的可处理操作集合，初始化
-        for v in range(self.nop):
-            for M in range(self.nmach):
-                if rd.Prt[v][M] < rd.infinite:
-                    # 可行的处理时间
-                    self.prtime[v][M] = int(rd.Prt[v][M])
-                    self.Machs[M].add(v) # 记录机器 M 能处理的操作 v
-                else:
-                    # 不可行的机器设为 0（保持与原 read_input 行为一致）
-                    self.prtime[v][M] = 0
+        self.prtime = rd.Prt# 每个操作对应的机器开始时间初始化为0
+        self.Machs = rd.Machs # 每台机器对应的可处理操作集合，初始化
+        # for v in range(self.nop):
+        #     for M in range(self.nmach):
+        #         if rd.Prt[v][M] < rd.infinite:
+        #             # 可行的处理时间
+        #             self.prtime[v][M] = int(rd.Prt[v][M])
+        #             self.Machs[M].add(v) # 记录机器 M 能处理的操作 v
+        #         else:
+        #             # 不可行的机器设为 0（保持与原 read_input 行为一致）
+        #             self.prtime[v][M] = 0
         
         # 创建机器索引映射
-        midx = [dict() for _ in range(self.nop)] # midx[v][M] = k 表示操作 v 在机器 M 上的索引为 j
+        midx = [dict() for _ in range(self.nop)] #e.g. midx[0][3] = 0 -> [{'3':0}] 表示索引为0时，操作0在机器3上操作
         for v in range(self.nop):
             for M in range(self.nmach):
                 if v in self.Machs[M]:
                     j = len(midx[v]) # 当前已有的机器数
                     midx[v][M] = j # 记录机器 M 在操作 v 上的索引
         
-        # 创建软约束映射，指机器内顺序约束。现在没有考虑先后关系，只是在记录每个机器上操作对
+        # 创建软约束映射，指机器内顺序约束。现在没有考虑先后关系（(v, w), (w, v)均存在），只是在记录每个机器上操作对
         soft = {}
         for M in range(self.nmach):
             for v in range(self.nop - 1):
@@ -73,7 +69,7 @@ class FJSP_CPLEX_Solver:
                     k = len(soft)
                     soft[(v, w)] = k
                     soft[(w, v)] = k + 1
-                    k += 2
+                    # k += 2
         
         # 确定上界 L
         L = 0.0
@@ -95,12 +91,13 @@ class FJSP_CPLEX_Solver:
                 L = float(preset_L)
             else:
                 # 计算上界L（使用每个操作的最大处理时间之和作为上界）
-                for v in range(self.nop):
-                    x = 0.0
-                    for M in range(self.nmach):
-                        if v in self.Machs[M] and self.prtime[v][M] > x:
-                            x = self.prtime[v][M]
-                    L += x
+                # for v in range(self.nop):
+                #     x = 0.0
+                #     for M in range(self.nmach):
+                #         if v in self.Machs[M] and self.prtime[v][M] > x:
+                #             x = self.prtime[v][M]
+                #     L += x
+                L = rd.infinite
         
         print(f"L = {L}")
         

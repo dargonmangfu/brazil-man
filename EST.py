@@ -28,7 +28,7 @@ class ESTHeuristic:
             howmany = 0
             total = 0.0
             for k in range(self.numm):
-                if self.Prt[v][k] < self.infinite:
+                if self.Prt[v][k] > 0:
                     total += self.Prt[v][k]
                     howmany += 1
             meanprt[v] = total / howmany if howmany > 0 else 0.0
